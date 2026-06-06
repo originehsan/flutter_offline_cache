@@ -1,8 +1,5 @@
 name: flutter_offline_cache
-description: >-
-  Offline-first caching for Flutter with stale-while-revalidate pattern.
-  Wraps Dio and Hive with TTL management, background revalidation,
-  request deduplication, and offline fallback via reactive streams.
+description: Offline-first stale-while-revalidate caching for Flutter with TTL management, background revalidation, and offline fallback.
 version: 0.1.1
 homepage: https://github.com/originehsan/flutter_offline_cache
 
