@@ -1,6 +1,6 @@
 name: flutter_offline_cache
 description: Offline-first stale-while-revalidate caching for Flutter with TTL management, background revalidation, and offline fallback.
-version: 0.1.1
+version: 0.1.2
 homepage: https://github.com/originehsan/flutter_offline_cache
 
 environment:
