@@ -10,7 +10,8 @@ export 'src/coordinator/cache_coordinator.dart';
 export 'src/models/cache_state.dart';
 
 // Configuration
-export 'src/models/cache_config.dart';
+// Configuration
+export 'src/models/cache_config.dart' show CacheConfig, cacheForever;
 export 'src/models/cache_policy.dart';
 
 // Metadata — available on CacheSuccess and CacheRevalidating states

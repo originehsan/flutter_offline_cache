@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:developer';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:dio/dio.dart';
 import 'package:rxdart/rxdart.dart';
 import '../models/cache_state.dart';
@@ -16,8 +17,7 @@ import 'state_snapshot_registry.dart';
 import 'invalidation_handler.dart';
 
 /// Holds stable fetcher configuration per cache key.
-/// Bug 3 fix — forceRevalidate removed entirely.
-/// Never store transient intent flags in long-lived config.
+/// forceRevalidate intentionally absent — never store transient flags.
 class _CacheFetcherConfig<T> {
   final Future<Response<dynamic>> Function() networkFetcher;
   final T Function(dynamic json) fromJsonConverter;
@@ -32,6 +32,36 @@ class _CacheFetcherConfig<T> {
   });
 }
 
+/// Main entry point for flutter_offline_cache.
+///
+/// Implements stale-while-revalidate caching with:
+/// - Automatic TTL-based background revalidation
+/// - Offline fallback via cached data
+/// - Request deduplication
+/// - App lifecycle awareness (pause/resume timers)
+///
+/// ## Basic usage
+/// ```dart
+/// final coordinator = CacheCoordinator();
+/// await coordinator.initialize();
+///
+/// final stream = coordinator.cachedFetch<List<Post>>(
+///   namespace: 'PostRepository',
+///   key: 'all_posts',
+///   networkFetcher: () => dio.get('/posts'),
+///   fromJsonConverter: (json) => (json as List)
+///       .map((e) => Post.fromJson(e))
+///       .toList(),
+/// );
+/// ```
+///
+/// ## Lifecycle management
+/// Call [attachFlutterLifecycle] to pause TTL timers when app
+/// goes to background and resume when app comes back:
+/// ```dart
+/// await coordinator.initialize();
+/// coordinator.attachFlutterLifecycle();
+/// ```
 class CacheCoordinator {
   final CacheConfig _cacheConfig;
   final CacheStore _cacheStore;
@@ -43,20 +73,31 @@ class CacheCoordinator {
       _activeBehaviorSubjectMap = {};
   final Map<String, _CacheFetcherConfig<dynamic>> _fetcherConfigMap = {};
 
-  /// Bug 2 fix — tracks active pipeline ID per key.
+  /// Tracks active pipeline ID per key.
   /// Emissions from superseded pipelines are discarded.
   final Map<String, int> _activePipelineIdMap = {};
 
-  /// Bug 2 fix — tracks active subscription per key.
+  /// Tracks active subscription per key.
   /// Old subscription cancelled before starting new pipeline.
   final Map<String, StreamSubscription<dynamic>> _pipelineSubscriptionMap = {};
+
+  /// One cancellable Timer per key for TTL auto-revalidation.
+  final Map<String, Timer> _ttlTimerMap = {};
+
+  /// Tracks exact deadline per key for accurate resume after background.
+  /// Used to calculate remaining TTL when app resumes.
+  final Map<String, DateTime> _ttlDeadlineMap = {};
 
   late final FetchPipeline _fetchPipeline;
   late final InvalidationHandler _invalidationHandler;
 
   bool _isInitialized = false;
   bool _isDisposed = false;
+  bool _isAppActive = true;
   Completer<void>? _initializationCompleter;
+
+  /// Flutter lifecycle listener — attached via [attachFlutterLifecycle].
+  AppLifecycleListener? _lifecycleListener;
 
   CacheCoordinator({
     CacheConfig? cacheConfig,
@@ -90,7 +131,6 @@ class CacheCoordinator {
   /// Safe to call multiple times — subsequent calls are no-ops.
   /// Thread safe — concurrent calls wait for first to complete.
   Future<void> initialize() async {
-    // Bug 7 fix — check disposed before initialized
     if (_isDisposed) {
       throw StateError(
         'CacheCoordinator: Already disposed. '
@@ -112,8 +152,6 @@ class CacheCoordinator {
       _initializationCompleter!.complete();
       _debugLog('✅ CacheCoordinator initialized');
     } catch (error) {
-      // Bug 6 fix — null completer BEFORE completeError
-      // so concurrent callers can retry after failure
       final Completer<void> failedCompleter = _initializationCompleter!;
       _initializationCompleter = null;
       failedCompleter.completeError(error);
@@ -121,12 +159,45 @@ class CacheCoordinator {
     }
   }
 
+  /// Attaches Flutter app lifecycle listener to pause and resume
+  /// TTL revalidation timers based on app state.
+  ///
+  /// Call this once after [initialize]:
+  /// ```dart
+  /// await coordinator.initialize();
+  /// coordinator.attachFlutterLifecycle();
+  /// ```
+  ///
+  /// Only attaches if [CacheConfig.pauseRevalidationWhenBackgrounded]
+  /// is true (default). Safe to call multiple times — subsequent
+  /// calls are no-ops.
+  ///
+  /// This keeps the coordinator core pure Dart — Flutter lifecycle
+  /// is opt-in via this method.
+  void attachFlutterLifecycle() {
+    if (!_cacheConfig.pauseRevalidationWhenBackgrounded) return;
+    if (_lifecycleListener != null) return;
+    if (_isDisposed) return;
+
+    _lifecycleListener = AppLifecycleListener(
+      onPause: _handleAppPaused,
+      onDetach: _handleAppPaused,
+      // Do NOT pause on inactive — iOS fires inactive frequently
+      // during phone calls, app switcher, etc. causing visible flicker.
+      onResume: _handleAppResumed,
+      onRestart: _handleAppResumed,
+    );
+
+    _debugLog('📱 Flutter lifecycle listener attached');
+  }
+
   /// Returns a typed stream of [CacheState] for the given cache key.
   /// Implements stale-while-revalidate.
   ///
-  /// Bug 1 fix — returns _rehydratedStream instead of .cast()
-  /// Bug 3 fix — forceRevalidate passed as runtime param, not stored
-  /// Bug 4 fix — subject created once, never recreated
+  /// [ttl] — how long cached data is considered fresh.
+  /// Pass [cacheForever] to never auto-revalidate.
+  /// Pass [Duration.zero] for always-stale SWR behavior.
+  /// Defaults to [CacheConfig.defaultTtl].
   Stream<CacheState<T>> cachedFetch<T>({
     required String namespace,
     required String key,
@@ -139,7 +210,10 @@ class CacheCoordinator {
     _assertUsable();
 
     final String namespacedCacheKey = KeyBuilder.build(namespace, key);
-    final Duration resolvedTtl = ttl ?? _cacheConfig.defaultTtl;
+
+    // Resolve effective TTL using CacheConfig rules
+    final Duration resolvedTtl =
+        _cacheConfig.resolveEffectiveTtl(ttl) ?? cacheForever;
 
     _debugLog(
       '┌─────────────────────────────────────\n'
@@ -148,12 +222,11 @@ class CacheCoordinator {
       '│ forceRevalidate: $forceRevalidate\n'
       '│ subjectExists: ${_activeBehaviorSubjectMap.containsKey(namespacedCacheKey)}\n'
       '│ subjectClosed: ${_activeBehaviorSubjectMap[namespacedCacheKey]?.isClosed}\n'
-      '│ ttl: ${resolvedTtl.inSeconds}s\n'
+      '│ ttl: ${CacheConfig.isForever(resolvedTtl) ? 'forever' : '${resolvedTtl.inSeconds}s'}\n'
       '└─────────────────────────────────────',
     );
 
     // Always update fetcher config with latest values
-    // Bug 3 fix — forceRevalidate NOT stored in config
     _fetcherConfigMap[namespacedCacheKey] = _CacheFetcherConfig<T>(
       networkFetcher: networkFetcher,
       fromJsonConverter: fromJsonConverter,
@@ -161,7 +234,7 @@ class CacheCoordinator {
       networkTimeout: networkTimeout,
     );
 
-    // Bug 4 fix — subject created only here, never in _restartPipelineForKey
+    // Subject created only here — never recreated elsewhere
     final BehaviorSubject<CacheState<dynamic>> behaviorSubject =
         _activeBehaviorSubjectMap.putIfAbsent(
       namespacedCacheKey,
@@ -171,16 +244,18 @@ class CacheCoordinator {
       },
     );
 
-    // If forceRevalidate or no pipeline running — start pipeline
-    final bool pipelineAlreadyRunning =
-        _pipelineSubscriptionMap.containsKey(namespacedCacheKey);
+    // Prevent duplicate pipelines from Riverpod re-evaluation.
+    // CacheLoading and CacheRevalidating mean pipeline is actively
+    // running even if subscription was already removed from map.
+    final bool pipelineEffectivelyRunning =
+        _pipelineSubscriptionMap.containsKey(namespacedCacheKey) ||
+            (behaviorSubject.hasValue &&
+                (behaviorSubject.value is CacheLoading<dynamic> ||
+                    behaviorSubject.value is CacheRevalidating<dynamic>));
 
-    if (forceRevalidate || !pipelineAlreadyRunning) {
-      _debugLog(
-        forceRevalidate
-            ? '🔄 forceRevalidate=true — starting new pipeline'
-            : '▶️  no active pipeline — starting pipeline',
-      );
+    if (forceRevalidate) {
+      _cancelTtlTimer(namespacedCacheKey);
+      _debugLog('🔄 forceRevalidate=true — starting new pipeline');
       _feedPipelineIntoSubject<T>(
         namespacedCacheKey: namespacedCacheKey,
         resolvedTtl: resolvedTtl,
@@ -188,13 +263,27 @@ class CacheCoordinator {
         fromJsonConverter: fromJsonConverter,
         behaviorSubject: behaviorSubject,
         networkTimeout: networkTimeout,
-        forceRevalidate: forceRevalidate,
+        forceRevalidate: true,
+      );
+    } else if (!pipelineEffectivelyRunning) {
+      _debugLog('▶️  no active pipeline — starting pipeline');
+      _feedPipelineIntoSubject<T>(
+        namespacedCacheKey: namespacedCacheKey,
+        resolvedTtl: resolvedTtl,
+        networkFetcher: networkFetcher,
+        fromJsonConverter: fromJsonConverter,
+        behaviorSubject: behaviorSubject,
+        networkTimeout: networkTimeout,
+        forceRevalidate: false,
       );
     } else {
-      _debugLog('♻️  pipeline already running — returning existing subject');
+      _debugLog(
+        '♻️  pipeline effectively running — skipping\n'
+        '   subscriptionInMap: ${_pipelineSubscriptionMap.containsKey(namespacedCacheKey)}\n'
+        '   subjectState: ${behaviorSubject.hasValue ? behaviorSubject.value.runtimeType : "no value"}',
+      );
     }
 
-    // Bug 1 fix — rehydrate stream instead of cast
     return _rehydratedStream<T>(behaviorSubject, fromJsonConverter);
   }
 
@@ -210,6 +299,7 @@ class CacheCoordinator {
     final String namespacedCacheKey = KeyBuilder.build(namespace, key);
     _debugLog('🔃 refresh() called for key: $namespacedCacheKey');
 
+    _cancelTtlTimer(namespacedCacheKey);
     _restartPipelineForKey(
       namespacedCacheKey: namespacedCacheKey,
       networkTimeout: networkTimeout,
@@ -228,6 +318,7 @@ class CacheCoordinator {
     final String namespacedCacheKey = KeyBuilder.build(namespace, key);
     _debugLog('🗑️  invalidate() called for key: $namespacedCacheKey');
 
+    _cancelTtlTimer(namespacedCacheKey);
     await _invalidationHandler.invalidateSingleKey(namespacedCacheKey);
     _restartPipelineForKey(namespacedCacheKey: namespacedCacheKey);
   }
@@ -238,6 +329,10 @@ class CacheCoordinator {
     _assertUsable();
 
     _debugLog('🗑️  invalidateAll() called');
+
+    for (final key in _ttlTimerMap.keys.toList()) {
+      _cancelTtlTimer(key);
+    }
 
     await _invalidationHandler.invalidateAllKeys();
 
@@ -252,11 +347,20 @@ class CacheCoordinator {
   /// Safe to call multiple times — subsequent calls are no-ops.
   Future<void> dispose() async {
     if (_isDisposed) return;
-
-    // Bug 7 fix — set disposed before closing subjects
     _isDisposed = true;
 
     _debugLog('♻️  CacheCoordinator disposing...');
+
+    // Dispose lifecycle listener first
+    _lifecycleListener?.dispose();
+    _lifecycleListener = null;
+
+    // Cancel all TTL timers — prevents revalidation after dispose
+    for (final timer in _ttlTimerMap.values) {
+      timer.cancel();
+    }
+    _ttlTimerMap.clear();
+    _ttlDeadlineMap.clear();
 
     // Cancel all active pipeline subscriptions
     for (final subscription in _pipelineSubscriptionMap.values) {
@@ -281,8 +385,69 @@ class CacheCoordinator {
     _debugLog('✅ CacheCoordinator disposed');
   }
 
+  /// Called when app goes to background.
+  /// Cancels all TTL timers and records remaining time per key.
+  void _handleAppPaused() {
+    if (_isDisposed) return;
+    if (!_isAppActive) return;
+
+    _isAppActive = false;
+    _debugLog('📱 app paused — pausing all TTL timers');
+
+    final DateTime now = DateTime.now();
+
+    for (final key in _ttlTimerMap.keys.toList()) {
+      final DateTime? deadline = _ttlDeadlineMap[key];
+      if (deadline != null) {
+        final Duration remaining = deadline.difference(now);
+        // Store remaining time — used to reschedule on resume
+        // If already past deadline store zero — fires immediately on resume
+        _ttlDeadlineMap[key] = now.add(
+          remaining.isNegative ? Duration.zero : remaining,
+        );
+      }
+      _ttlTimerMap[key]?.cancel();
+      _ttlTimerMap.remove(key);
+    }
+  }
+
+  /// Called when app comes to foreground.
+  /// Reschedules TTL timers with accurate remaining duration.
+  void _handleAppResumed() {
+    if (_isDisposed) return;
+    if (_isAppActive) return;
+
+    _isAppActive = true;
+    _debugLog('📱 app resumed — resuming TTL timers');
+
+    final DateTime now = DateTime.now();
+    final List<String> keys = _ttlDeadlineMap.keys.toList();
+
+    for (final key in keys) {
+      final DateTime? deadline = _ttlDeadlineMap[key];
+      final _CacheFetcherConfig<dynamic>? config = _fetcherConfigMap[key];
+
+      if (deadline == null || config == null) continue;
+
+      final Duration remaining = deadline.difference(now);
+
+      if (remaining <= Duration.zero) {
+        // TTL already expired while in background — revalidate immediately
+        _ttlDeadlineMap.remove(key);
+        _debugLog('⏰ TTL expired in background — revalidating: $key');
+        _restartPipelineForKey(namespacedCacheKey: key);
+      } else {
+        // Reschedule with accurate remaining duration
+        _ttlDeadlineMap.remove(key);
+        _scheduleWithDeadline(key, remaining);
+        _debugLog(
+            '⏰ rescheduling TTL timer — ${remaining.inSeconds}s remaining for: $key');
+      }
+    }
+  }
+
   /// Restarts pipeline for key using stored fetcher config.
-  /// Bug 4 fix — NEVER creates new subject here.
+  /// Never creates new subject — subject only created in cachedFetch.
   /// Returns early if no subject or config exists.
   void _restartPipelineForKey({
     required String namespacedCacheKey,
@@ -300,8 +465,6 @@ class CacheCoordinator {
       return;
     }
 
-    // Bug 4 fix — if no subject exists, nothing to restart
-    // Subject only created in cachedFetch
     if (subject == null || subject.isClosed) {
       _debugLog(
           '⚠️  _restartPipelineForKey — no open subject for: $namespacedCacheKey');
@@ -309,7 +472,7 @@ class CacheCoordinator {
     }
 
     _debugLog(
-        '🔄 _restartPipelineForKey — reusing existing subject for: $namespacedCacheKey');
+        '🔄 _restartPipelineForKey — reusing subject for: $namespacedCacheKey');
 
     _feedPipelineIntoSubject(
       namespacedCacheKey: namespacedCacheKey,
@@ -323,9 +486,6 @@ class CacheCoordinator {
   }
 
   /// Starts pipeline and feeds emissions into subject.
-  /// Bug 2 fix — assigns pipeline ID per key.
-  /// Discards emissions from superseded pipelines.
-  /// Cancels previous subscription before starting new one.
   void _feedPipelineIntoSubject<T>({
     required String namespacedCacheKey,
     required Duration resolvedTtl,
@@ -335,7 +495,6 @@ class CacheCoordinator {
     Duration? networkTimeout,
     bool forceRevalidate = false,
   }) {
-    // Bug 2 fix — get next pipeline ID from instance counter
     final int thisPipelineId = _fetchPipeline.nextPipelineId();
     _activePipelineIdMap[namespacedCacheKey] = thisPipelineId;
 
@@ -346,8 +505,8 @@ class CacheCoordinator {
       '   forceRevalidate: $forceRevalidate',
     );
 
-    // Bug 2 fix — cancel previous subscription before starting new one
     _pipelineSubscriptionMap[namespacedCacheKey]?.cancel();
+    _cancelTtlTimer(namespacedCacheKey);
 
     final StreamSubscription<CacheState<T>> subscription = _fetchPipeline
         .executeFetchPipeline<T>(
@@ -363,7 +522,6 @@ class CacheCoordinator {
           (CacheState<T> state) {
             if (_isDisposed) return;
 
-            // Bug 2 fix — discard emissions from superseded pipelines
             final int? activePipelineId =
                 _activePipelineIdMap[namespacedCacheKey];
             if (activePipelineId != thisPipelineId) {
@@ -393,10 +551,21 @@ class CacheCoordinator {
             }
           },
           onDone: () {
-            // Clean up subscription map when pipeline completes
+            final int? activePipelineId =
+                _activePipelineIdMap[namespacedCacheKey];
+            if (activePipelineId != thisPipelineId) {
+              _debugLog(
+                '⏭️  onDone from superseded pipeline #$thisPipelineId — ignoring\n'
+                '   active pipeline is #$activePipelineId',
+              );
+              return;
+            }
+
             _pipelineSubscriptionMap.remove(namespacedCacheKey);
             _debugLog(
                 '✅ pipeline #$thisPipelineId done for: $namespacedCacheKey');
+
+            _scheduleTtlRevalidation(namespacedCacheKey);
           },
           cancelOnError: false,
         );
@@ -404,9 +573,77 @@ class CacheCoordinator {
     _pipelineSubscriptionMap[namespacedCacheKey] = subscription;
   }
 
-  /// Bug 1 fix — maps BehaviorSubject_CacheState_dynamic to
-  /// typed StreamCacheStateT using safe rehydration.
-  /// Never uses .cast() — rehydrates each state individually.
+  /// Schedules TTL revalidation timer.
+  /// Skips scheduling for [cacheForever] entries.
+  /// Handles app-backgrounded state correctly.
+  void _scheduleTtlRevalidation(String namespacedCacheKey) {
+    if (_isDisposed) return;
+
+    final _CacheFetcherConfig<dynamic>? config =
+        _fetcherConfigMap[namespacedCacheKey];
+    if (config == null) return;
+
+    // cacheForever — no timer needed
+    if (CacheConfig.isForever(config.resolvedTtl)) {
+      _debugLog('♾️  cacheForever — no TTL timer for: $namespacedCacheKey');
+      return;
+    }
+
+    // Duration.zero — always stale — revalidate on next event loop turn
+    if (CacheConfig.isAlwaysStale(config.resolvedTtl)) {
+      _debugLog('⚡ alwaysStale — scheduling immediate revalidation for: $namespacedCacheKey');
+      _cancelTtlTimer(namespacedCacheKey);
+      _ttlTimerMap[namespacedCacheKey] = Timer(Duration.zero, () {
+        _ttlTimerMap.remove(namespacedCacheKey);
+        if (_isDisposed) return;
+        _restartPipelineForKey(namespacedCacheKey: namespacedCacheKey);
+      });
+      return;
+    }
+
+    // App is in background — store deadline for accurate resume
+    if (!_isAppActive && _cacheConfig.pauseRevalidationWhenBackgrounded) {
+      _ttlDeadlineMap[namespacedCacheKey] =
+          DateTime.now().add(config.resolvedTtl);
+      _debugLog(
+          '📱 app in background — storing TTL deadline for: $namespacedCacheKey');
+      return;
+    }
+
+    _scheduleWithDeadline(namespacedCacheKey, config.resolvedTtl);
+  }
+
+  /// Schedules Timer with given duration and records deadline.
+  void _scheduleWithDeadline(
+      String namespacedCacheKey, Duration duration) {
+    _cancelTtlTimer(namespacedCacheKey);
+
+    _ttlDeadlineMap[namespacedCacheKey] =
+        DateTime.now().add(duration);
+
+    _debugLog(
+        '⏰ scheduling TTL revalidation in ${duration.inSeconds}s for: $namespacedCacheKey');
+
+    _ttlTimerMap[namespacedCacheKey] = Timer(duration, () {
+      _ttlTimerMap.remove(namespacedCacheKey);
+      _ttlDeadlineMap.remove(namespacedCacheKey);
+      if (_isDisposed) return;
+      final BehaviorSubject<CacheState<dynamic>>? subject =
+          _activeBehaviorSubjectMap[namespacedCacheKey];
+      if (subject == null || subject.isClosed) return;
+      _debugLog('⏰ TTL expired — auto-revalidating: $namespacedCacheKey');
+      _restartPipelineForKey(namespacedCacheKey: namespacedCacheKey);
+    });
+  }
+
+  /// Cancels and removes TTL timer and deadline for key.
+  void _cancelTtlTimer(String namespacedCacheKey) {
+    _ttlTimerMap.remove(namespacedCacheKey)?.cancel();
+    _ttlDeadlineMap.remove(namespacedCacheKey);
+  }
+
+  /// Maps BehaviorSubject<CacheState<dynamic to typed
+  /// Stream<CacheState<T using safe rehydration.
   Stream<CacheState<T>> _rehydratedStream<T>(
     BehaviorSubject<CacheState<dynamic>> subject,
     T Function(dynamic json) fromJsonConverter,
@@ -459,8 +696,6 @@ class CacheCoordinator {
 
   /// Returns value directly if already typed as T.
   /// Only calls fromJsonConverter if value is raw JSON.
-  /// Prevents double-conversion crash when cached data is
-  /// already typed from a previous emission.
   T _coerceOrConvert<T>(
     dynamic value,
     T Function(dynamic json) fromJsonConverter,
@@ -469,8 +704,7 @@ class CacheCoordinator {
     return fromJsonConverter(value);
   }
 
-  /// Bug 7 fix — checks disposed BEFORE initialized.
-  /// Gives correct error message for each lifecycle state.
+  /// Checks disposed BEFORE initialized.
   void _assertUsable() {
     if (_isDisposed) {
       throw StateError(

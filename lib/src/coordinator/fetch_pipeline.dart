@@ -19,10 +19,20 @@ class FetchPipeline {
 
   static const Duration _defaultNetworkTimeout = Duration(seconds: 30);
 
-  /// Bug 8 fix — instance variable not static.
-  /// Static counter bleeds across test instances causing
-  /// cross-test pipeline ID pollution.
-  int _pipelineCounter = 0;
+ /// Initialize from current microsecond timestamp to prevent
+/// cross-session generation token conflicts.
+///
+/// Previous session pipelines will always have lower IDs than
+/// current session pipelines because each new app session starts
+/// with a counter value based on current time in microseconds.
+///
+/// microsecondsSinceEpoch used over milliseconds for better
+/// resolution — prevents ID collision if app restarts within
+/// same millisecond (common in tests and hot restart).
+///
+/// Safe range: microsecondsSinceEpoch fits in Dart int64 until
+/// year 285,423 — no overflow concern.
+int _pipelineCounter = DateTime.now().microsecondsSinceEpoch;
 
   FetchPipeline({
     required CacheStore cacheStore,
