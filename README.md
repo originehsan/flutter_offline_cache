@@ -27,6 +27,10 @@ This pattern keeps UIs responsive while keeping data fresh. Perfect for mobile w
 | **Background Refresh** | Manual background tasks, memory leaks | Coordinator manages lifecycle |
 | **Encryption** | Integrate flutter_secure_storage manually | One-line optional encryption |
 
+ ## Demo
+
+![flutter_offline_cache demo](assets/demo_cache.gif)
+
 ## Installation
 
 Add to `pubspec.yaml`:
