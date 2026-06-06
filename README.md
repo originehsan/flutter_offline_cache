@@ -31,7 +31,7 @@ This pattern keeps UIs responsive while keeping data fresh. Perfect for mobile w
 
 ## Demo
 
-![flutter_offline_cache demo](https://raw.githubusercontent.com/originehsan/flutter_offline_cache/main/assets/demo.gif)
+![flutter_offline_cache demo](https://raw.githubusercontent.com/originehsan/flutter_offline_cache/main/assets/demo_cache.gif)
 
 ## Installation
 
