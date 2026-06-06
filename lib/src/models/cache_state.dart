@@ -1,16 +1,17 @@
 import 'cache_metadata.dart';
+import '../network/error_classifier.dart';
 
 /// Represents all possible states of a cache operation.
 /// Use Dart 3 pattern matching to handle all states exhaustively.
 ///
 /// ```dart
 /// switch (state) {
-///   case CacheInitial():  // show nothing
-///   case CacheLoading():  // show full screen loader
-///   case CacheSuccess():  // show data
+///   case CacheInitial():      // show nothing
+///   case CacheLoading():      // show full screen loader
+///   case CacheSuccess():      // show data
 ///   case CacheRevalidating(): // show data + refresh banner
-///   case CacheStale():    // show data + error toast
-///   case CacheError():    // show error screen
+///   case CacheStale():        // show data + error toast
+///   case CacheError():        // show error screen
 /// }
 /// ```
 sealed class CacheState<T> {
@@ -18,7 +19,6 @@ sealed class CacheState<T> {
 }
 
 /// Initial state before any cache operation has started.
-/// Emitted when coordinator is created but no fetch has been called yet.
 final class CacheInitial<T> extends CacheState<T> {
   const CacheInitial();
 }
@@ -58,8 +58,6 @@ final class CacheSuccess<T> extends CacheState<T> {
 
 /// Cached data is being shown while a background refresh is running.
 /// Show data normally — optionally show a small refresh indicator.
-/// [cachedData] — stale but usable data currently displayed.
-/// [entryMetadata] — metadata of the stale entry being revalidated.
 final class CacheRevalidating<T> extends CacheState<T> {
   /// Stale but usable cached data currently shown to the user.
   final T cachedData;
@@ -75,8 +73,6 @@ final class CacheRevalidating<T> extends CacheState<T> {
 
 /// Background refresh failed but stale cached data is still available.
 /// Show cached data with an error toast — do not replace with error screen.
-/// [cachedData] — old data still shown to user.
-/// [refreshError] — the error that occurred during background refresh.
 final class CacheStale<T> extends CacheState<T> {
   /// Old cached data still shown to the user.
   final T cachedData;
@@ -96,8 +92,11 @@ final class CacheStale<T> extends CacheState<T> {
 
 /// Hard failure — no cached data exists and network request failed.
 /// Show a full screen error with retry option.
-/// [networkError] — the error that caused the failure.
-/// [isOfflineFailure] — true if failure was due to no internet connection.
+///
+/// ## Migration from v0.0.x
+/// [isOfflineFailure] is now a computed getter based on
+/// [errorClassification]. Existing code using [isOfflineFailure]
+/// continues to work without changes.
 final class CacheError<T> extends CacheState<T> {
   /// The error that caused this failure.
   final Object networkError;
@@ -105,13 +104,36 @@ final class CacheError<T> extends CacheState<T> {
   /// Stack trace of the network error for debugging.
   final StackTrace? networkErrorStackTrace;
 
-  /// True if failure was caused by no internet connectivity.
-  /// False if failure was caused by server error (4xx, 5xx).
-  final bool isOfflineFailure;
+  /// Specific classification of the network error.
+  /// Use this for more granular error handling.
+  final ErrorClassification errorClassification;
 
   const CacheError({
     required this.networkError,
-    required this.isOfflineFailure,
+    required this.errorClassification,
     this.networkErrorStackTrace,
   });
+
+  /// True if failure was caused by no internet connectivity.
+  bool get isOfflineFailure =>
+      errorClassification == ErrorClassification.offlineFailure;
+
+  /// True if failure was caused by request timeout.
+  /// Server may be slow or temporarily unreachable.
+  bool get isTimeoutFailure =>
+      errorClassification == ErrorClassification.timeoutFailure;
+
+  /// True if failure was caused by API rate limiting (HTTP 429).
+  bool get isRateLimited =>
+      errorClassification == ErrorClassification.rateLimitFailure;
+
+  /// True if failure was caused by server error (4xx, 5xx).
+  bool get isServerError =>
+      errorClassification == ErrorClassification.serverFailure;
+
+  /// True if cached data should be served as fallback.
+  /// Both offline and timeout failures should show cached data.
+  bool get shouldShowCachedFallback =>
+      errorClassification == ErrorClassification.offlineFailure ||
+      errorClassification == ErrorClassification.timeoutFailure;
 }

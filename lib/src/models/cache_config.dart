@@ -19,7 +19,10 @@ class CacheConfig {
 
   /// Name of the Hive box used by this package.
   /// Override if this conflicts with your app's existing Hive boxes.
-  /// Defaults to 'flutter_offline_cache'.
+  ///
+  /// Default uses a prefixed name to avoid collisions with
+  /// developer's own Hive boxes.
+  /// Defaults to '__foc_cache_v1__'.
   final String hiveBoxName;
 
   /// Optional AES encryption key for encrypting Hive box contents.
@@ -37,7 +40,7 @@ class CacheConfig {
     this.defaultTtl = const Duration(minutes: 10),
     this.defaultCachePolicy = CachePolicy.cacheFirst,
     this.maxEntrySizeBytes = 524288,
-    this.hiveBoxName = 'flutter_offline_cache',
+    this.hiveBoxName = '__foc_cache_v1__',
     this.encryptionKey,
     this.enableDebugLogs = false,
   }) : assert(

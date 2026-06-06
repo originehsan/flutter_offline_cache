@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_offline_cache_example/providers/cypto_provider.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_offline_cache/flutter_offline_cache.dart';
 import '../models/crypto_coin.dart';
+
 
 class CryptoScreen extends ConsumerStatefulWidget {
   const CryptoScreen({super.key});
@@ -15,16 +17,37 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
   bool _isOfflineSimulated = false;
   bool _isInitialized = false;
 
+  /// Timer that fires every second to update the cache age countdown.
+  /// Makes SWR behavior visually obvious — user watches countdown to revalidation.
+  Timer? _bannerRefreshTimer;
+
   @override
   void initState() {
     super.initState();
     _initialize();
+    _startBannerRefreshTimer();
+  }
+
+  @override
+  void dispose() {
+    _bannerRefreshTimer?.cancel();
+    super.dispose();
   }
 
   Future<void> _initialize() async {
     final coordinator = ref.read(cacheCoordinatorProvider);
     await coordinator.initialize();
     if (mounted) setState(() => _isInitialized = true);
+  }
+
+  /// Rebuilds banner every second so cache age and countdown update live.
+  void _startBannerRefreshTimer() {
+    _bannerRefreshTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) {
+        if (mounted) setState(() {});
+      },
+    );
   }
 
   @override
@@ -60,8 +83,8 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
       elevation: 0,
       title: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
+        children: const [
+          Text(
             'flutter_offline_cache',
             style: TextStyle(
               color: Color(0xFF58A6FF),
@@ -70,8 +93,8 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
               letterSpacing: 0.3,
             ),
           ),
-          const Text(
-            'Top 10 Coins — CoinGecko',
+          Text(
+            'Top 10 Coins — CoinGecko · TTL 30s',
             style: TextStyle(
               color: Color(0xFF8B949E),
               fontSize: 11,
@@ -116,9 +139,7 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
       CacheInitial() => const Center(
           child: CircularProgressIndicator(color: Color(0xFF58A6FF)),
         ),
-      CacheLoading() => const Center(
-          child: CircularProgressIndicator(color: Color(0xFF58A6FF)),
-        ),
+      CacheLoading() => _buildLoadingState(),
       CacheSuccess(:final cachedData, :final dataSource, :final entryMetadata) =>
         _buildCoinList(
           coins: cachedData,
@@ -133,15 +154,43 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
           metadata: entryMetadata,
           isRevalidating: true,
         ),
-      CacheStale(:final cachedData) => _buildCoinList(
+      CacheStale(:final cachedData, :final refreshError) => _buildCoinList(
           coins: cachedData,
           dataSource: CacheSource.localCache,
           metadata: null,
           isRevalidating: false,
           isStale: true,
+          staleError: refreshError,
         ),
-      CacheError(:final isOfflineFailure) => _buildErrorState(isOfflineFailure),
+      CacheError(:final errorClassification) =>
+        _buildErrorState(errorClassification),
     };
+  }
+
+  Widget _buildLoadingState() {
+    return Column(
+      children: [
+        Container(
+          width: double.infinity,
+          padding:
+              const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          color: const Color(0xFF0D1A2D),
+          child: const Text(
+            'Fetching live prices for the first time...',
+            style: TextStyle(
+              color: Color(0xFFB0BAC5),
+              fontSize: 11,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
+        const Expanded(
+          child: Center(
+            child: CircularProgressIndicator(color: Color(0xFF58A6FF)),
+          ),
+        ),
+      ],
+    );
   }
 
   Widget _buildCoinList({
@@ -150,6 +199,7 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
     required CacheMetadata? metadata,
     required bool isRevalidating,
     bool isStale = false,
+    Object? staleError,
   }) {
     return Column(
       children: [
@@ -158,7 +208,9 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
           metadata: metadata,
           isRevalidating: isRevalidating,
           isStale: isStale,
+          staleError: staleError,
         ),
+        if (metadata != null) _buildMetadataRow(metadata),
         Expanded(
           child: ListView.builder(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
@@ -171,47 +223,54 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
     );
   }
 
+  /// Status banner — changes color and text based on cache state.
   Widget _buildStatusBanner({
     required CacheSource dataSource,
     required CacheMetadata? metadata,
     required bool isRevalidating,
     bool isStale = false,
+    Object? staleError,
   }) {
     Color bannerColor;
     String bannerText;
+    Color textColor;
 
     if (isStale) {
-      bannerColor = const Color(0xFF3D2900);
-      bannerText = 'Could not refresh — showing cached data';
+      bannerColor = const Color(0xFF3D2000);
+      textColor = const Color(0xFFE3A000);
+      final errorMsg = staleError is Exception
+          ? staleError.toString().replaceAll('Exception: ', '')
+          : 'Network error';
+      bannerColor = const Color(0xFF3D2000);
+      bannerText = 'Could not refresh — $errorMsg — showing cached data';
     } else if (isRevalidating) {
       bannerColor = const Color(0xFF0D2137);
-      bannerText = 'Fetching latest prices...';
+      textColor = const Color(0xFF58A6FF);
+      bannerText = 'Fetching latest prices in background...';
     } else if (dataSource == CacheSource.localCache) {
-      final age = metadata?.ageOfCachedData;
-      final remaining = metadata?.remainingValidDuration;
       bannerColor = const Color(0xFF1A1033);
-      bannerText = metadata != null
-          ? 'Cached ${_formatDuration(age!)} ago — refreshes in ${_formatDuration(remaining!)}'
-          : 'Served from cache';
+      textColor = const Color(0xFFB0BAC5);
+      bannerText = 'Serving from cache';
     } else {
       bannerColor = const Color(0xFF0D2119);
+      textColor = const Color(0xFF3FB950);
       bannerText = metadata != null
-          ? 'Live data — cached at ${_formatTime(metadata.cachedAtMillis)}'
+          ? 'Live data fetched at ${_formatTime(metadata.cachedAtMillis)}'
           : 'Live data from network';
     }
 
     return AnimatedContainer(
-      duration: const Duration(milliseconds: 400),
+      duration: const Duration(milliseconds: 300),
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       color: bannerColor,
       child: Row(
         children: [
           Expanded(
             child: Text(
               bannerText,
-              style: const TextStyle(
-                color: Color(0xFFB0BAC5),
+              style: TextStyle(
+                color: textColor,
                 fontSize: 11,
                 fontWeight: FontWeight.w500,
                 letterSpacing: 0.2,
@@ -232,6 +291,89 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
     );
   }
 
+  /// Metadata row — shows live countdown to next revalidation.
+  /// Updates every second via _bannerRefreshTimer.
+  /// This makes SWR behavior visually obvious to recruiters.
+  Widget _buildMetadataRow(CacheMetadata metadata) {
+    final Duration age = metadata.ageOfCachedData;
+    final Duration remaining = metadata.remainingValidDuration;
+    final bool isExpiringSoon = remaining.inSeconds <= 5;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      color: const Color(0xFF0D1117),
+      child: Row(
+        children: [
+          // Cache age
+          _buildMetaChip(
+            label: 'Cached',
+            value: '${age.inSeconds}s ago',
+            color: const Color(0xFF484F58),
+          ),
+          const SizedBox(width: 8),
+          // Time until revalidation
+          _buildMetaChip(
+            label: 'Refreshes in',
+            value: remaining == Duration.zero
+                ? 'now'
+                : '${remaining.inSeconds}s',
+            color: isExpiringSoon
+                ? const Color(0xFFE3A000)
+                : const Color(0xFF484F58),
+          ),
+          const SizedBox(width: 8),
+          // Source
+          _buildMetaChip(
+            label: 'Source',
+            value: metadata.source == CacheSource.network
+                ? 'network'
+                : 'cache',
+            color: metadata.source == CacheSource.network
+                ? const Color(0xFF3FB950)
+                : const Color(0xFF58A6FF),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMetaChip({
+    required String label,
+    required String value,
+    required Color color,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
+      ),
+      child: RichText(
+        text: TextSpan(
+          children: [
+            TextSpan(
+              text: '$label: ',
+              style: const TextStyle(
+                color: Color(0xFF484F58),
+                fontSize: 10,
+              ),
+            ),
+            TextSpan(
+              text: value,
+              style: TextStyle(
+                color: color,
+                fontSize: 10,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildCoinCard(CryptoCoin coin, int index) {
     final bool isUp = coin.isPriceUp;
     final Color changeColor =
@@ -243,10 +385,7 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
       decoration: BoxDecoration(
         color: const Color(0xFF161B22),
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: const Color(0xFF30363D),
-          width: 1,
-        ),
+        border: Border.all(color: const Color(0xFF30363D)),
       ),
       child: Row(
         children: [
@@ -323,7 +462,6 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
                   borderRadius: BorderRadius.circular(6),
                   border: Border.all(
                     color: changeColor.withValues(alpha: 0.3),
-                    width: 1,
                   ),
                 ),
                 child: Text(
@@ -357,7 +495,32 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
     );
   }
 
-  Widget _buildErrorState(bool isOffline) {
+  Widget _buildErrorState(ErrorClassification classification) {
+    final bool isOffline =
+        classification == ErrorClassification.offlineFailure;
+    final bool isTimeout =
+        classification == ErrorClassification.timeoutFailure;
+    final bool isRateLimit =
+        classification == ErrorClassification.rateLimitFailure;
+
+    final String title;
+    final String subtitle;
+
+    if (isOffline) {
+      title = 'No internet connection';
+      subtitle = 'Turn off offline mode or check your connection';
+    } else if (isTimeout) {
+      title = 'Request timed out';
+      subtitle = 'Server is slow or unreachable. Try again.';
+    } else if (isRateLimit) {
+      title = 'Rate limited by CoinGecko';
+      subtitle =
+          'Too many requests. Wait a moment then try again.';
+    } else {
+      title = 'Something went wrong';
+      subtitle = 'CoinGecko API returned an error. Try again.';
+    }
+
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(32),
@@ -371,25 +534,36 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
             ),
             const SizedBox(height: 16),
             Text(
-              isOffline
-                  ? 'No internet connection'
-                  : 'Something went wrong',
+              title,
               style: const TextStyle(
                 color: Color(0xFFE6EDF3),
                 fontSize: 16,
                 fontWeight: FontWeight.w600,
               ),
+              textAlign: TextAlign.center,
             ),
             const SizedBox(height: 8),
             Text(
-              isOffline
-                  ? 'Turn off offline mode or check your connection'
-                  : 'CoinGecko API may be rate limiting. Try again.',
+              subtitle,
               textAlign: TextAlign.center,
               style: const TextStyle(
                 color: Color(0xFF8B949E),
                 fontSize: 13,
               ),
+            ),
+            const SizedBox(height: 24),
+            OutlinedButton(
+              onPressed: () async {
+                await ref
+                    .read(cryptoRepositoryProvider)
+                    .hardResetCoins();
+                ref.read(cryptoResetCounterProvider.notifier).state++;
+              },
+              style: OutlinedButton.styleFrom(
+                foregroundColor: const Color(0xFF58A6FF),
+                side: const BorderSide(color: Color(0xFF30363D)),
+              ),
+              child: const Text('Retry'),
             ),
           ],
         ),
@@ -456,15 +630,10 @@ class _CryptoScreenState extends ConsumerState<CryptoScreen> {
       return '\$${price.toStringAsFixed(6)}';
     }
   }
-
-  String _formatDuration(Duration d) {
-    if (d.inSeconds < 60) return '${d.inSeconds}s';
-    if (d.inMinutes < 60) return '${d.inMinutes}m';
-    return '${d.inHours}h';
-  }
-
   String _formatTime(int millis) {
     final dt = DateTime.fromMillisecondsSinceEpoch(millis);
-    return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}';
+    return '${dt.hour.toString().padLeft(2, '0')}:'
+        '${dt.minute.toString().padLeft(2, '0')}:'
+        '${dt.second.toString().padLeft(2, '0')}';
   }
 }

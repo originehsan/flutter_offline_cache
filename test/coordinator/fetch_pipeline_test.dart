@@ -23,7 +23,8 @@ void main() {
         statusCode: 200,
       );
 
-  Future<Response<dynamic>> mockFetcher(dynamic data) async => successResponse(data);
+  Future<Response<dynamic>> mockFetcher(dynamic data) async =>
+      successResponse(data);
 
   Future<Response<dynamic>> failingFetcher() async => throw DioException(
         requestOptions: RequestOptions(path: '/test'),
@@ -74,7 +75,9 @@ void main() {
             cacheKey: 'movies',
             ttl: const Duration(minutes: 10),
             networkFetcher: () => mockFetcher({'id': 1}),
-            fromJsonConverter: (json) => Map<String, dynamic>.from(json as Map),
+            fromJsonConverter: (json) =>
+                Map<String, dynamic>.from(json as Map),
+            pipelineId: 1,
           )
           .forEach(states.add);
 
@@ -96,7 +99,9 @@ void main() {
             cacheKey: 'movies',
             ttl: const Duration(minutes: 10),
             networkFetcher: failingFetcher,
-            fromJsonConverter: (json) => Map<String, dynamic>.from(json as Map),
+            fromJsonConverter: (json) =>
+                Map<String, dynamic>.from(json as Map),
+            pipelineId: 1,
           )
           .forEach(states.add);
 
@@ -108,7 +113,8 @@ void main() {
       expect(error.isOfflineFailure, isTrue);
     });
 
-    test('empty cache + server error emits Loading then CacheError isOffline false',
+    test(
+        'empty cache + server error emits Loading then CacheError isOffline false',
         () async {
       final List<CacheState<Map<String, dynamic>>> states = [];
 
@@ -117,7 +123,9 @@ void main() {
             cacheKey: 'movies',
             ttl: const Duration(minutes: 10),
             networkFetcher: serverErrorFetcher,
-            fromJsonConverter: (json) => Map<String, dynamic>.from(json as Map),
+            fromJsonConverter: (json) =>
+                Map<String, dynamic>.from(json as Map),
+            pipelineId: 1,
           )
           .forEach(states.add);
 
@@ -126,11 +134,11 @@ void main() {
       expect(error.isOfflineFailure, isFalse);
     });
 
-    test('fresh cache emits single CacheSuccess from cache — no network call',
+    test(
+        'fresh cache emits single CacheSuccess from cache — no network call',
         () async {
       int networkCallCount = 0;
 
-      // First populate cache
       await pipeline
           .executeFetchPipeline<Map<String, dynamic>>(
             cacheKey: 'movies',
@@ -139,13 +147,14 @@ void main() {
               networkCallCount++;
               return mockFetcher({'id': 1});
             },
-            fromJsonConverter: (json) => Map<String, dynamic>.from(json as Map),
+            fromJsonConverter: (json) =>
+                Map<String, dynamic>.from(json as Map),
+            pipelineId: 1,
           )
           .forEach((_) {});
 
       networkCallCount = 0;
 
-      // Second call — cache is fresh
       final List<CacheState<Map<String, dynamic>>> states = [];
       await pipeline
           .executeFetchPipeline<Map<String, dynamic>>(
@@ -155,7 +164,9 @@ void main() {
               networkCallCount++;
               return mockFetcher({'id': 1});
             },
-            fromJsonConverter: (json) => Map<String, dynamic>.from(json as Map),
+            fromJsonConverter: (json) =>
+                Map<String, dynamic>.from(json as Map),
+            pipelineId: 2,
           )
           .forEach(states.add);
 
@@ -170,17 +181,17 @@ void main() {
     test(
         'stale cache emits CacheRevalidating then CacheSuccess from network',
         () async {
-      // Populate cache with very short TTL
       await pipeline
           .executeFetchPipeline<Map<String, dynamic>>(
             cacheKey: 'movies',
             ttl: const Duration(milliseconds: 1),
             networkFetcher: () => mockFetcher({'id': 1, 'version': 1}),
-            fromJsonConverter: (json) => Map<String, dynamic>.from(json as Map),
+            fromJsonConverter: (json) =>
+                Map<String, dynamic>.from(json as Map),
+            pipelineId: 1,
           )
           .forEach((_) {});
 
-      // Wait for TTL to expire
       await Future<void>.delayed(const Duration(milliseconds: 10));
 
       final List<CacheState<Map<String, dynamic>>> states = [];
@@ -189,7 +200,9 @@ void main() {
             cacheKey: 'movies',
             ttl: const Duration(minutes: 10),
             networkFetcher: () => mockFetcher({'id': 1, 'version': 2}),
-            fromJsonConverter: (json) => Map<String, dynamic>.from(json as Map),
+            fromJsonConverter: (json) =>
+                Map<String, dynamic>.from(json as Map),
+            pipelineId: 2,
           )
           .forEach(states.add);
 
@@ -202,15 +215,17 @@ void main() {
       expect(success.cachedData['version'], equals(2));
     });
 
-    test('stale cache + network failure emits CacheRevalidating then CacheStale',
+    test(
+        'stale cache + network failure emits CacheRevalidating then CacheStale',
         () async {
-      // Populate cache with very short TTL
       await pipeline
           .executeFetchPipeline<Map<String, dynamic>>(
             cacheKey: 'movies',
             ttl: const Duration(milliseconds: 1),
             networkFetcher: () => mockFetcher({'id': 1}),
-            fromJsonConverter: (json) => Map<String, dynamic>.from(json as Map),
+            fromJsonConverter: (json) =>
+                Map<String, dynamic>.from(json as Map),
+            pipelineId: 1,
           )
           .forEach((_) {});
 
@@ -222,7 +237,9 @@ void main() {
             cacheKey: 'movies',
             ttl: const Duration(minutes: 10),
             networkFetcher: failingFetcher,
-            fromJsonConverter: (json) => Map<String, dynamic>.from(json as Map),
+            fromJsonConverter: (json) =>
+                Map<String, dynamic>.from(json as Map),
+            pipelineId: 2,
           )
           .forEach(states.add);
 
@@ -240,14 +257,13 @@ void main() {
             cacheKey: 'movies',
             ttl: const Duration(minutes: 10),
             networkFetcher: () => mockFetcher({'id': 1}),
-            fromJsonConverter: (json) =>
-                throw FormatException('Bad format'),
+            fromJsonConverter: (json) => throw FormatException('Bad format'),
+            pipelineId: 1,
           )
           .forEach(states.add);
 
       expect(states.last, isA<CacheError<Map<String, dynamic>>>());
 
-      // Hive should not have been written
       final bool exists = await store.cacheEntryExists('movies');
       expect(exists, isFalse);
     });
@@ -269,6 +285,7 @@ void main() {
               networkFetcher: countingFetcher,
               fromJsonConverter: (json) =>
                   Map<String, dynamic>.from(json as Map),
+              pipelineId: 1,
             )
             .forEach((_) {}),
         pipeline
@@ -278,6 +295,7 @@ void main() {
               networkFetcher: countingFetcher,
               fromJsonConverter: (json) =>
                   Map<String, dynamic>.from(json as Map),
+              pipelineId: 2,
             )
             .forEach((_) {}),
         pipeline
@@ -287,6 +305,7 @@ void main() {
               networkFetcher: countingFetcher,
               fromJsonConverter: (json) =>
                   Map<String, dynamic>.from(json as Map),
+              pipelineId: 3,
             )
             .forEach((_) {}),
       ]);
@@ -294,33 +313,32 @@ void main() {
       expect(networkCallCount, equals(1));
     });
 
-    test(
-        'newer pipeline skips write but still yields CacheSuccess',
-        () async {
-      // First populate cache
+    test('newer pipeline skips write but still yields CacheSuccess', () async {
       await pipeline
           .executeFetchPipeline<Map<String, dynamic>>(
             cacheKey: 'movies',
             ttl: const Duration(milliseconds: 1),
             networkFetcher: () => mockFetcher({'version': 1}),
-            fromJsonConverter: (json) => Map<String, dynamic>.from(json as Map),
+            fromJsonConverter: (json) =>
+                Map<String, dynamic>.from(json as Map),
+            pipelineId: 1,
           )
           .forEach((_) {});
 
       await Future<void>.delayed(const Duration(milliseconds: 10));
 
-      // Run two pipelines — second should detect first already wrote
       final List<CacheState<Map<String, dynamic>>> states = [];
       await pipeline
           .executeFetchPipeline<Map<String, dynamic>>(
             cacheKey: 'movies',
             ttl: const Duration(minutes: 10),
             networkFetcher: () => mockFetcher({'version': 2}),
-            fromJsonConverter: (json) => Map<String, dynamic>.from(json as Map),
+            fromJsonConverter: (json) =>
+                Map<String, dynamic>.from(json as Map),
+            pipelineId: 2,
           )
           .forEach(states.add);
 
-      // Should still emit CacheSuccess even if write was skipped
       expect(
           states.any((s) => s is CacheSuccess<Map<String, dynamic>>), isTrue);
     });

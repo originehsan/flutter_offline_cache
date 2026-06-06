@@ -17,6 +17,11 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 /// This is acceptable for cache data but must be documented so developers
 /// do not misdiagnose it as a persistence bug.
 ///
+/// ## Multiple Coordinators
+/// If you use multiple [CacheCoordinator] instances with different encryption
+/// keys, pass a unique [storageKeyName] to each [SecureKeyGenerator].
+/// Using the same key name across coordinators will share the same AES key.
+///
 /// ## Testability
 /// Pass a mock [FlutterSecureStorage] via constructor injection in tests.
 ///
@@ -27,32 +32,42 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 /// final config = CacheConfig(encryptionKey: key);
 /// ```
 class SecureKeyGenerator {
-  /// Creates a [SecureKeyGenerator] with an optional [FlutterSecureStorage].
-  /// Defaults to [const FlutterSecureStorage()] if none is provided.
+  /// Creates a [SecureKeyGenerator] with optional [FlutterSecureStorage]
+  /// and optional [storageKeyName].
+  ///
+  /// [storageKeyName] — the key name used when storing AES key in secure
+  /// storage. Override this if you use multiple coordinators with different
+  /// encryption keys. Never change this between app versions for the same
+  /// coordinator — changing it makes all existing encrypted cache permanently
+  /// unreadable.
+  ///
+  /// Defaults to [defaultStorageKeyName] if not provided.
   const SecureKeyGenerator({
     FlutterSecureStorage? storage,
-  }) : _storage = storage ?? const FlutterSecureStorage();
+    String? storageKeyName,
+  })  : _storage = storage ?? const FlutterSecureStorage(),
+        _storageKeyName = storageKeyName ?? defaultStorageKeyName;
 
   final FlutterSecureStorage _storage;
+  final String _storageKeyName;
 
   /// Required key length in bytes for AES-256 encryption.
   static const int _requiredKeyLengthBytes = 32;
 
-  /// Storage key name for persisting the AES encryption key.
-  /// Never change this between app versions — changing it makes
-  /// all existing encrypted cached data permanently unreadable.
-  static const String _secureStorageKeyName =
+  /// Default storage key name for persisting the AES encryption key.
+  /// Override via [storageKeyName] constructor parameter when using
+  /// multiple coordinators with separate encryption keys.
+  static const String defaultStorageKeyName =
       'flutter_offline_cache_aes_key';
 
   /// Retrieves the existing AES-256 key from secure storage.
-  /// Generates and persists a new key if none exists or if stored key is corrupt.
+  /// Generates and persists a new key if none exists or stored key is corrupt.
   ///
   /// Throws [StateError] if the key cannot be written to secure storage.
   Future<Uint8List> getOrCreateEncryptionKey() async {
-    // Only secure storage read is wrapped — not decode or generation logic
     String? existingKeyBase64;
     try {
-      existingKeyBase64 = await _storage.read(key: _secureStorageKeyName);
+      existingKeyBase64 = await _storage.read(key: _storageKeyName);
     } catch (_) {
       // OS Keystore/Keychain read failed — fall through to regeneration
       existingKeyBase64 = null;
@@ -75,17 +90,18 @@ class SecureKeyGenerator {
       _requiredKeyLengthBytes,
     );
 
-    // Only storage write is wrapped — write failure is fatal
     try {
       await _storage.write(
-        key: _secureStorageKeyName,
+        key: _storageKeyName,
         value: base64Encode(freshKey),
       );
     } catch (writeError) {
       throw StateError(
         'flutter_offline_cache: Failed to persist AES encryption key '
         'to secure storage. Ensure flutter_secure_storage is correctly '
-        'configured for your platform. Caused by: $writeError',
+        'configured for your platform. '
+        'Storage key name: $_storageKeyName. '
+        'Caused by: $writeError',
       );
     }
 

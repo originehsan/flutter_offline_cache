@@ -15,17 +15,20 @@ import 'fetch_pipeline.dart';
 import 'state_snapshot_registry.dart';
 import 'invalidation_handler.dart';
 
+/// Holds stable fetcher configuration per cache key.
+/// Bug 3 fix — forceRevalidate removed entirely.
+/// Never store transient intent flags in long-lived config.
 class _CacheFetcherConfig<T> {
   final Future<Response<dynamic>> Function() networkFetcher;
   final T Function(dynamic json) fromJsonConverter;
   final Duration resolvedTtl;
-  final bool forceRevalidate;
+  final Duration? networkTimeout;
 
   const _CacheFetcherConfig({
     required this.networkFetcher,
     required this.fromJsonConverter,
     required this.resolvedTtl,
-    this.forceRevalidate = false,
+    this.networkTimeout,
   });
 }
 
@@ -39,6 +42,14 @@ class CacheCoordinator {
   final Map<String, BehaviorSubject<CacheState<dynamic>>>
       _activeBehaviorSubjectMap = {};
   final Map<String, _CacheFetcherConfig<dynamic>> _fetcherConfigMap = {};
+
+  /// Bug 2 fix — tracks active pipeline ID per key.
+  /// Emissions from superseded pipelines are discarded.
+  final Map<String, int> _activePipelineIdMap = {};
+
+  /// Bug 2 fix — tracks active subscription per key.
+  /// Old subscription cancelled before starting new pipeline.
+  final Map<String, StreamSubscription<dynamic>> _pipelineSubscriptionMap = {};
 
   late final FetchPipeline _fetchPipeline;
   late final InvalidationHandler _invalidationHandler;
@@ -74,24 +85,48 @@ class CacheCoordinator {
     );
   }
 
+  /// Initializes coordinator and opens Hive storage box.
+  /// Must be called and awaited before any [cachedFetch] call.
+  /// Safe to call multiple times — subsequent calls are no-ops.
+  /// Thread safe — concurrent calls wait for first to complete.
   Future<void> initialize() async {
+    // Bug 7 fix — check disposed before initialized
+    if (_isDisposed) {
+      throw StateError(
+        'CacheCoordinator: Already disposed. '
+        'Create a new CacheCoordinator instance.',
+      );
+    }
+
     if (_isInitialized) return;
+
     if (_initializationCompleter != null) {
       return _initializationCompleter!.future;
     }
+
     _initializationCompleter = Completer<void>();
+
     try {
       await _cacheStore.initializeStorage();
       _isInitialized = true;
       _initializationCompleter!.complete();
       _debugLog('✅ CacheCoordinator initialized');
     } catch (error) {
-      _initializationCompleter!.completeError(error);
+      // Bug 6 fix — null completer BEFORE completeError
+      // so concurrent callers can retry after failure
+      final Completer<void> failedCompleter = _initializationCompleter!;
       _initializationCompleter = null;
+      failedCompleter.completeError(error);
       rethrow;
     }
   }
 
+  /// Returns a typed stream of [CacheState] for the given cache key.
+  /// Implements stale-while-revalidate.
+  ///
+  /// Bug 1 fix — returns _rehydratedStream instead of .cast()
+  /// Bug 3 fix — forceRevalidate passed as runtime param, not stored
+  /// Bug 4 fix — subject created once, never recreated
   Stream<CacheState<T>> cachedFetch<T>({
     required String namespace,
     required String key,
@@ -101,104 +136,79 @@ class CacheCoordinator {
     Duration? networkTimeout,
     bool forceRevalidate = false,
   }) {
-    _assertInitialized();
-    _assertNotDisposed();
+    _assertUsable();
 
     final String namespacedCacheKey = KeyBuilder.build(namespace, key);
     final Duration resolvedTtl = ttl ?? _cacheConfig.defaultTtl;
 
-    final bool subjectExists =
-        _activeBehaviorSubjectMap.containsKey(namespacedCacheKey);
-    final bool subjectClosed =
-        _activeBehaviorSubjectMap[namespacedCacheKey]?.isClosed ?? true;
-
     _debugLog(
       '┌─────────────────────────────────────\n'
       '│ cachedFetch called\n'
-      '│ namespace: $namespace\n'
-      '│ key: $key\n'
+      '│ namespace: $namespace key: $key\n'
       '│ forceRevalidate: $forceRevalidate\n'
-      '│ subjectExists: $subjectExists\n'
-      '│ subjectClosed: $subjectClosed\n'
+      '│ subjectExists: ${_activeBehaviorSubjectMap.containsKey(namespacedCacheKey)}\n'
+      '│ subjectClosed: ${_activeBehaviorSubjectMap[namespacedCacheKey]?.isClosed}\n'
       '│ ttl: ${resolvedTtl.inSeconds}s\n'
       '└─────────────────────────────────────',
     );
 
+    // Always update fetcher config with latest values
+    // Bug 3 fix — forceRevalidate NOT stored in config
     _fetcherConfigMap[namespacedCacheKey] = _CacheFetcherConfig<T>(
       networkFetcher: networkFetcher,
       fromJsonConverter: fromJsonConverter,
       resolvedTtl: resolvedTtl,
-      forceRevalidate: forceRevalidate,
-    );
-
-    if (forceRevalidate) {
-      final existing = _activeBehaviorSubjectMap[namespacedCacheKey];
-      if (existing != null && !existing.isClosed) {
-        _debugLog(
-          '🔄 forceRevalidate=true — existing subject OPEN\n'
-          '   restarting pipeline into same subject\n'
-          '   subscribers will see CacheRevalidating immediately',
-        );
-        _feedPipelineIntoSubject<T>(
-          namespacedCacheKey: namespacedCacheKey,
-          resolvedTtl: resolvedTtl,
-          networkFetcher: networkFetcher,
-          fromJsonConverter: fromJsonConverter,
-          behaviorSubject: existing,
-          networkTimeout: networkTimeout,
-          forceRevalidate: true,
-        );
-        return existing.stream.cast<CacheState<T>>();
-      }
-      _debugLog(
-        '🔄 forceRevalidate=true — no open subject found\n'
-        '   creating new subject and pipeline',
-      );
-      _activeBehaviorSubjectMap.remove(namespacedCacheKey);
-    }
-
-    if (_activeBehaviorSubjectMap.containsKey(namespacedCacheKey)) {
-      final existing = _activeBehaviorSubjectMap[namespacedCacheKey]!;
-      if (!existing.isClosed) {
-        _debugLog('♻️  returning existing open subject — no new pipeline');
-        return existing.stream.cast<CacheState<T>>();
-      }
-      _activeBehaviorSubjectMap.remove(namespacedCacheKey);
-    }
-
-    _debugLog('🆕 creating new BehaviorSubject and starting pipeline');
-
-    final BehaviorSubject<CacheState<dynamic>> behaviorSubject =
-        BehaviorSubject<CacheState<dynamic>>();
-
-    _activeBehaviorSubjectMap[namespacedCacheKey] = behaviorSubject;
-
-    _feedPipelineIntoSubject<T>(
-      namespacedCacheKey: namespacedCacheKey,
-      resolvedTtl: resolvedTtl,
-      networkFetcher: networkFetcher,
-      fromJsonConverter: fromJsonConverter,
-      behaviorSubject: behaviorSubject,
       networkTimeout: networkTimeout,
-      forceRevalidate: forceRevalidate,
     );
 
-    return behaviorSubject.stream.cast<CacheState<T>>();
+    // Bug 4 fix — subject created only here, never in _restartPipelineForKey
+    final BehaviorSubject<CacheState<dynamic>> behaviorSubject =
+        _activeBehaviorSubjectMap.putIfAbsent(
+      namespacedCacheKey,
+      () {
+        _debugLog('🆕 creating new BehaviorSubject for: $namespacedCacheKey');
+        return BehaviorSubject<CacheState<dynamic>>();
+      },
+    );
+
+    // If forceRevalidate or no pipeline running — start pipeline
+    final bool pipelineAlreadyRunning =
+        _pipelineSubscriptionMap.containsKey(namespacedCacheKey);
+
+    if (forceRevalidate || !pipelineAlreadyRunning) {
+      _debugLog(
+        forceRevalidate
+            ? '🔄 forceRevalidate=true — starting new pipeline'
+            : '▶️  no active pipeline — starting pipeline',
+      );
+      _feedPipelineIntoSubject<T>(
+        namespacedCacheKey: namespacedCacheKey,
+        resolvedTtl: resolvedTtl,
+        networkFetcher: networkFetcher,
+        fromJsonConverter: fromJsonConverter,
+        behaviorSubject: behaviorSubject,
+        networkTimeout: networkTimeout,
+        forceRevalidate: forceRevalidate,
+      );
+    } else {
+      _debugLog('♻️  pipeline already running — returning existing subject');
+    }
+
+    // Bug 1 fix — rehydrate stream instead of cast
+    return _rehydratedStream<T>(behaviorSubject, fromJsonConverter);
   }
 
+  /// Force-refreshes cache for given key.
+  /// Bypasses TTL — triggers network fetch regardless of freshness.
   Future<void> refresh({
     required String namespace,
     required String key,
     Duration? networkTimeout,
   }) async {
-    _assertInitialized();
-    _assertNotDisposed();
+    _assertUsable();
 
     final String namespacedCacheKey = KeyBuilder.build(namespace, key);
-
     _debugLog('🔃 refresh() called for key: $namespacedCacheKey');
-
-    await _snapshotRegistry.removeStateForKey(namespacedCacheKey);
 
     _restartPipelineForKey(
       namespacedCacheKey: namespacedCacheKey,
@@ -207,24 +217,25 @@ class CacheCoordinator {
     );
   }
 
+  /// Invalidates cache entry for given key.
+  /// Deletes cached data and restarts pipeline.
   Future<void> invalidate({
     required String namespace,
     required String key,
   }) async {
-    _assertInitialized();
-    _assertNotDisposed();
+    _assertUsable();
 
     final String namespacedCacheKey = KeyBuilder.build(namespace, key);
-
     _debugLog('🗑️  invalidate() called for key: $namespacedCacheKey');
 
     await _invalidationHandler.invalidateSingleKey(namespacedCacheKey);
     _restartPipelineForKey(namespacedCacheKey: namespacedCacheKey);
   }
 
+  /// Invalidates all cache entries.
+  /// Call this on user logout.
   Future<void> invalidateAll() async {
-    _assertInitialized();
-    _assertNotDisposed();
+    _assertUsable();
 
     _debugLog('🗑️  invalidateAll() called');
 
@@ -237,14 +248,26 @@ class CacheCoordinator {
     }
   }
 
+  /// Disposes all resources.
+  /// Safe to call multiple times — subsequent calls are no-ops.
   Future<void> dispose() async {
     if (_isDisposed) return;
+
+    // Bug 7 fix — set disposed before closing subjects
     _isDisposed = true;
 
     _debugLog('♻️  CacheCoordinator disposing...');
 
+    // Cancel all active pipeline subscriptions
+    for (final subscription in _pipelineSubscriptionMap.values) {
+      await subscription.cancel();
+    }
+    _pipelineSubscriptionMap.clear();
+    _activePipelineIdMap.clear();
+
+    // Close all active subjects
     for (final subject in _activeBehaviorSubjectMap.values) {
-      if (!subject.isClosed) subject.close();
+      if (!subject.isClosed) await subject.close();
     }
     _activeBehaviorSubjectMap.clear();
     _fetcherConfigMap.clear();
@@ -258,6 +281,9 @@ class CacheCoordinator {
     _debugLog('✅ CacheCoordinator disposed');
   }
 
+  /// Restarts pipeline for key using stored fetcher config.
+  /// Bug 4 fix — NEVER creates new subject here.
+  /// Returns early if no subject or config exists.
   void _restartPipelineForKey({
     required String namespacedCacheKey,
     Duration? networkTimeout,
@@ -270,35 +296,36 @@ class CacheCoordinator {
 
     if (config == null) {
       _debugLog(
-          '⚠️  _restartPipelineForKey — no config found for: $namespacedCacheKey');
+          '⚠️  _restartPipelineForKey — no config for: $namespacedCacheKey');
       return;
     }
 
-    final BehaviorSubject<CacheState<dynamic>> activeSubject =
-        (subject == null || subject.isClosed)
-            ? BehaviorSubject<CacheState<dynamic>>()
-            : subject;
-
+    // Bug 4 fix — if no subject exists, nothing to restart
+    // Subject only created in cachedFetch
     if (subject == null || subject.isClosed) {
-      _activeBehaviorSubjectMap[namespacedCacheKey] = activeSubject;
       _debugLog(
-          '🆕 _restartPipelineForKey — created new subject for: $namespacedCacheKey');
-    } else {
-      _debugLog(
-          '🔄 _restartPipelineForKey — reusing existing subject for: $namespacedCacheKey');
+          '⚠️  _restartPipelineForKey — no open subject for: $namespacedCacheKey');
+      return;
     }
+
+    _debugLog(
+        '🔄 _restartPipelineForKey — reusing existing subject for: $namespacedCacheKey');
 
     _feedPipelineIntoSubject(
       namespacedCacheKey: namespacedCacheKey,
       resolvedTtl: config.resolvedTtl,
       networkFetcher: config.networkFetcher,
       fromJsonConverter: config.fromJsonConverter,
-      behaviorSubject: activeSubject,
-      networkTimeout: networkTimeout,
+      behaviorSubject: subject,
+      networkTimeout: networkTimeout ?? config.networkTimeout,
       forceRevalidate: forceRevalidate,
     );
   }
 
+  /// Starts pipeline and feeds emissions into subject.
+  /// Bug 2 fix — assigns pipeline ID per key.
+  /// Discards emissions from superseded pipelines.
+  /// Cancels previous subscription before starting new one.
   void _feedPipelineIntoSubject<T>({
     required String namespacedCacheKey,
     required Duration resolvedTtl,
@@ -308,13 +335,21 @@ class CacheCoordinator {
     Duration? networkTimeout,
     bool forceRevalidate = false,
   }) {
+    // Bug 2 fix — get next pipeline ID from instance counter
+    final int thisPipelineId = _fetchPipeline.nextPipelineId();
+    _activePipelineIdMap[namespacedCacheKey] = thisPipelineId;
+
     _debugLog(
       '▶️  _feedPipelineIntoSubject\n'
       '   key: $namespacedCacheKey\n'
+      '   pipelineId: $thisPipelineId\n'
       '   forceRevalidate: $forceRevalidate',
     );
 
-    _fetchPipeline
+    // Bug 2 fix — cancel previous subscription before starting new one
+    _pipelineSubscriptionMap[namespacedCacheKey]?.cancel();
+
+    final StreamSubscription<CacheState<T>> subscription = _fetchPipeline
         .executeFetchPipeline<T>(
           cacheKey: namespacedCacheKey,
           ttl: resolvedTtl,
@@ -322,47 +357,132 @@ class CacheCoordinator {
           fromJsonConverter: fromJsonConverter,
           networkTimeout: networkTimeout,
           forceRevalidate: forceRevalidate,
+          pipelineId: thisPipelineId,
         )
         .listen(
           (CacheState<T> state) {
             if (_isDisposed) return;
+
+            // Bug 2 fix — discard emissions from superseded pipelines
+            final int? activePipelineId =
+                _activePipelineIdMap[namespacedCacheKey];
+            if (activePipelineId != thisPipelineId) {
+              _debugLog(
+                '⏭️  discarding emission from superseded pipeline '
+                '#$thisPipelineId (active: #$activePipelineId)',
+              );
+              return;
+            }
+
             if (!behaviorSubject.isClosed) {
               _debugLog(
-                  '📡 subject.add(${state.runtimeType}) for: $namespacedCacheKey');
+                  '📡 subject.add(${state.runtimeType}) pipeline #$thisPipelineId');
               behaviorSubject.add(state);
-            } else {
-              _debugLog(
-                  '⚠️  tried to emit ${state.runtimeType} but subject is closed');
             }
           },
           onError: (Object error, StackTrace stackTrace) {
             if (_isDisposed) return;
+
+            final int? activePipelineId =
+                _activePipelineIdMap[namespacedCacheKey];
+            if (activePipelineId != thisPipelineId) return;
+
             if (!behaviorSubject.isClosed) {
-              _debugLog('❌ subject.addError: $error');
+              _debugLog('❌ pipeline #$thisPipelineId addError: $error');
               behaviorSubject.addError(error, stackTrace);
             }
           },
           onDone: () {
+            // Clean up subscription map when pipeline completes
+            _pipelineSubscriptionMap.remove(namespacedCacheKey);
             _debugLog(
-                '✅ pipeline done for key: $namespacedCacheKey — subject kept alive');
+                '✅ pipeline #$thisPipelineId done for: $namespacedCacheKey');
           },
+          cancelOnError: false,
         );
+
+    _pipelineSubscriptionMap[namespacedCacheKey] = subscription;
   }
 
-  void _assertInitialized() {
-    if (!_isInitialized) {
-      throw StateError(
-        'CacheCoordinator: Not initialized. '
-        'Always await initialize() before calling cachedFetch().',
-      );
-    }
+  /// Bug 1 fix — maps BehaviorSubject_CacheState_dynamic to
+  /// typed StreamCacheStateT using safe rehydration.
+  /// Never uses .cast() — rehydrates each state individually.
+  Stream<CacheState<T>> _rehydratedStream<T>(
+    BehaviorSubject<CacheState<dynamic>> subject,
+    T Function(dynamic json) fromJsonConverter,
+  ) {
+    return subject.stream.map((CacheState<dynamic> state) {
+      return switch (state) {
+        CacheSuccess<dynamic>(
+          :final cachedData,
+          :final dataSource,
+          :final entryMetadata,
+        ) =>
+          CacheSuccess<T>(
+            cachedData: _coerceOrConvert<T>(cachedData, fromJsonConverter),
+            dataSource: dataSource,
+            entryMetadata: entryMetadata,
+          ),
+        CacheRevalidating<dynamic>(
+          :final cachedData,
+          :final entryMetadata,
+        ) =>
+          CacheRevalidating<T>(
+            cachedData: _coerceOrConvert<T>(cachedData, fromJsonConverter),
+            entryMetadata: entryMetadata,
+          ),
+        CacheStale<dynamic>(
+          :final cachedData,
+          :final refreshError,
+          :final refreshErrorStackTrace,
+        ) =>
+          CacheStale<T>(
+            cachedData: _coerceOrConvert<T>(cachedData, fromJsonConverter),
+            refreshError: refreshError,
+            refreshErrorStackTrace: refreshErrorStackTrace,
+          ),
+        CacheLoading<dynamic>() => CacheLoading<T>(),
+        CacheInitial<dynamic>() => CacheInitial<T>(),
+        CacheError<dynamic>(
+          :final networkError,
+          :final errorClassification,
+          :final networkErrorStackTrace,
+        ) =>
+          CacheError<T>(
+            networkError: networkError,
+            errorClassification: errorClassification,
+            networkErrorStackTrace: networkErrorStackTrace,
+          ),
+      };
+    });
   }
 
-  void _assertNotDisposed() {
+  /// Returns value directly if already typed as T.
+  /// Only calls fromJsonConverter if value is raw JSON.
+  /// Prevents double-conversion crash when cached data is
+  /// already typed from a previous emission.
+  T _coerceOrConvert<T>(
+    dynamic value,
+    T Function(dynamic json) fromJsonConverter,
+  ) {
+    if (value is T) return value;
+    return fromJsonConverter(value);
+  }
+
+  /// Bug 7 fix — checks disposed BEFORE initialized.
+  /// Gives correct error message for each lifecycle state.
+  void _assertUsable() {
     if (_isDisposed) {
       throw StateError(
         'CacheCoordinator: Already disposed. '
         'Create a new CacheCoordinator instance.',
+      );
+    }
+    if (!_isInitialized) {
+      throw StateError(
+        'CacheCoordinator: Not initialized. '
+        'Always await initialize() before calling cachedFetch(). '
+        'Example: await coordinator.initialize();',
       );
     }
   }

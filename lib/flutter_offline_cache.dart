@@ -16,6 +16,9 @@ export 'src/models/cache_policy.dart';
 // Metadata — available on CacheSuccess and CacheRevalidating states
 export 'src/models/cache_metadata.dart';
 
+// Error classification — use with CacheError.errorClassification in UI
+export 'src/network/error_classifier.dart';
+
 // Abstract interfaces — inject mocks in tests
 export 'src/store/cache_store.dart';
 export 'src/network/connectivity_checker.dart';

@@ -8,7 +8,7 @@ void main() {
       expect(config.defaultTtl, equals(const Duration(minutes: 10)));
       expect(config.defaultCachePolicy, equals(CachePolicy.cacheFirst));
       expect(config.maxEntrySizeBytes, equals(524288));
-      expect(config.hiveBoxName, equals('flutter_offline_cache'));
+      expect(config.hiveBoxName, equals('__foc_cache_v1__'));
       expect(config.isEncryptionEnabled, isFalse);
       expect(config.enableDebugLogs, isFalse);
     });

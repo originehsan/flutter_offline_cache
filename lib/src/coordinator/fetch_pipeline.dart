@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:developer';
 import 'package:flutter/foundation.dart';
 import 'package:dio/dio.dart';
 import '../models/cache_state.dart';
@@ -19,7 +18,11 @@ class FetchPipeline {
   final CacheConfig _cacheConfig;
 
   static const Duration _defaultNetworkTimeout = Duration(seconds: 30);
-  static int _pipelineCounter = 0;
+
+  /// Bug 8 fix — instance variable not static.
+  /// Static counter bleeds across test instances causing
+  /// cross-test pipeline ID pollution.
+  int _pipelineCounter = 0;
 
   FetchPipeline({
     required CacheStore cacheStore,
@@ -31,21 +34,25 @@ class FetchPipeline {
         _snapshotRegistry = snapshotRegistry,
         _cacheConfig = cacheConfig;
 
+  /// Returns next monotonic pipeline ID.
+  /// Called by coordinator before starting each pipeline.
+  int nextPipelineId() => ++_pipelineCounter;
+
   Stream<CacheState<T>> executeFetchPipeline<T>({
     required String cacheKey,
     required Duration ttl,
     required Future<Response<dynamic>> Function() networkFetcher,
     required T Function(dynamic json) fromJsonConverter,
+    required int pipelineId,
     Duration? networkTimeout,
     bool forceRevalidate = false,
   }) async* {
     final Duration resolvedTimeout =
         networkTimeout ?? _defaultNetworkTimeout;
-    final int thisPipelineId = ++_pipelineCounter;
 
     _debugLog(
       '┌─────────────────────────────────────\n'
-      '│ PIPELINE #$thisPipelineId STARTED\n'
+      '│ PIPELINE #$pipelineId STARTED\n'
       '│ key: $cacheKey\n'
       '│ ttl: ${ttl.inSeconds}s\n'
       '│ forceRevalidate: $forceRevalidate\n'
@@ -56,13 +63,16 @@ class FetchPipeline {
         await _cacheStore.readCacheEntry(cacheKey);
 
     final bool hasCachedData = existingEntry != null;
+
+    // Bug 9 fix — use else if chain instead of three separate if blocks.
+    // Mutually exclusive states must not be evaluated independently.
     final bool isCachedDataFresh =
         hasCachedData && existingEntry.isStillFresh && !forceRevalidate;
     final bool isCachedDataStale =
         hasCachedData && (existingEntry.hasExpired || forceRevalidate);
 
     _debugLog(
-      '│ PIPELINE #$thisPipelineId CACHE CHECK\n'
+      '│ PIPELINE #$pipelineId CACHE CHECK\n'
       '│ hasCachedData: $hasCachedData\n'
       '│ isCachedDataFresh: $isCachedDataFresh\n'
       '│ isCachedDataStale: $isCachedDataStale\n'
@@ -70,14 +80,19 @@ class FetchPipeline {
       '│ forceRevalidate: $forceRevalidate',
     );
 
-    // FRESH CACHE — serve and return, no network
+    // Bug 9 fix — else if chain guarantees only one branch executes
     if (isCachedDataFresh) {
+      // FRESH CACHE — serve immediately and return, no network call
       final T? cachedTypedData = _decodeEntry(
-          existingEntry, fromJsonConverter, cacheKey, thisPipelineId);
+        existingEntry,
+        fromJsonConverter,
+        cacheKey,
+        pipelineId,
+      );
 
       if (cachedTypedData != null) {
         _debugLog(
-            '✅ PIPELINE #$thisPipelineId → YIELD CacheSuccess(localCache) — DONE');
+            '✅ PIPELINE #$pipelineId → YIELD CacheSuccess(localCache) — DONE');
         final CacheSuccess<T> freshState = CacheSuccess<T>(
           cachedData: cachedTypedData,
           dataSource: CacheSource.localCache,
@@ -88,24 +103,26 @@ class FetchPipeline {
         return;
       }
 
+      // Fresh entry decode failed — corrupt entry, delete and fall through
       _debugLog(
-          '⚠️  PIPELINE #$thisPipelineId — fresh cache decode failed, deleting');
+          '⚠️  PIPELINE #$pipelineId — fresh cache decode failed, deleting');
       await _cacheStore.deleteCacheEntry(cacheKey);
       final CacheLoading<T> loadingState = CacheLoading<T>();
       await _snapshotRegistry.saveLatestState(cacheKey, loadingState);
       _debugLog(
-          '⏳ PIPELINE #$thisPipelineId → YIELD CacheLoading (fresh decode failed)');
+          '⏳ PIPELINE #$pipelineId → YIELD CacheLoading (fresh decode failed)');
       yield loadingState;
-    }
-
-    // STALE CACHE — serve immediately then hit network
-    if (isCachedDataStale) {
+    } else if (isCachedDataStale) {
+      // STALE CACHE — serve immediately then continue to network
       final T? staleTypedData = _decodeEntry(
-          existingEntry, fromJsonConverter, cacheKey, thisPipelineId);
+        existingEntry,
+        fromJsonConverter,
+        cacheKey,
+        pipelineId,
+      );
 
       if (staleTypedData != null) {
-        _debugLog(
-            '🔄 PIPELINE #$thisPipelineId → YIELD CacheRevalidating');
+        _debugLog('🔄 PIPELINE #$pipelineId → YIELD CacheRevalidating');
         final CacheRevalidating<T> revalidatingState = CacheRevalidating<T>(
           cachedData: staleTypedData,
           entryMetadata: existingEntry.entryMetadata,
@@ -113,26 +130,24 @@ class FetchPipeline {
         await _snapshotRegistry.saveLatestState(cacheKey, revalidatingState);
         yield revalidatingState;
       } else {
-        _debugLog(
-            '⚠️  PIPELINE #$thisPipelineId — stale decode failed');
+        // Stale entry decode failed — treat as no cache
+        _debugLog('⚠️  PIPELINE #$pipelineId — stale decode failed');
         final CacheLoading<T> loadingState = CacheLoading<T>();
         await _snapshotRegistry.saveLatestState(cacheKey, loadingState);
         _debugLog(
-            '⏳ PIPELINE #$thisPipelineId → YIELD CacheLoading (stale decode failed)');
+            '⏳ PIPELINE #$pipelineId → YIELD CacheLoading (stale decode failed)');
         yield loadingState;
       }
-    }
-
-    // NO CACHE — show loading
-    if (!hasCachedData) {
-      _debugLog('⏳ PIPELINE #$thisPipelineId → YIELD CacheLoading (no cache)');
+    } else {
+      // NO CACHE — show loading
+      _debugLog('⏳ PIPELINE #$pipelineId → YIELD CacheLoading (no cache)');
       final CacheLoading<T> loadingState = CacheLoading<T>();
       await _snapshotRegistry.saveLatestState(cacheKey, loadingState);
       yield loadingState;
     }
 
-    // NETWORK FETCH
-    _debugLog('🌐 PIPELINE #$thisPipelineId — starting network fetch...');
+    // NETWORK FETCH — runs for stale and no-cache paths
+    _debugLog('🌐 PIPELINE #$pipelineId — starting network fetch...');
 
     try {
       final dynamic networkResponseData = await _dedupRegistry
@@ -146,7 +161,7 @@ class FetchPipeline {
             ),
           );
 
-      _debugLog('✅ PIPELINE #$thisPipelineId — network fetch SUCCESS');
+      _debugLog('✅ PIPELINE #$pipelineId — network fetch SUCCESS');
 
       final String encodedNetworkPayload =
           CacheSerializer.encodeResponseToJsonString(
@@ -154,6 +169,7 @@ class FetchPipeline {
         maxBytes: _cacheConfig.maxEntrySizeBytes,
       );
 
+      // Decode BEFORE writing — never overwrite good cache with bad data
       final T freshTypedData;
       try {
         freshTypedData = CacheSerializer.decodeJsonStringToTyped<T>(
@@ -161,20 +177,24 @@ class FetchPipeline {
           fromJsonConverter: fromJsonConverter,
         );
         _debugLog(
-            '✅ PIPELINE #$thisPipelineId — network response decoded successfully');
+            '✅ PIPELINE #$pipelineId — network response decoded successfully');
       } on CacheSerializationException catch (decodeError, decodeStack) {
-        _debugLog(
-            '❌ PIPELINE #$thisPipelineId — decode FAILED: $decodeError');
+        _debugLog('❌ PIPELINE #$pipelineId — decode FAILED: $decodeError');
 
+        // Never write bad data — serve last good cache as stale
         final CacheEntry? entryForDecodeError =
             await _cacheStore.readCacheEntry(cacheKey);
 
         if (entryForDecodeError != null) {
           final T? lastGoodData = _decodeEntry(
-              entryForDecodeError, fromJsonConverter, cacheKey, thisPipelineId);
+            entryForDecodeError,
+            fromJsonConverter,
+            cacheKey,
+            pipelineId,
+          );
           if (lastGoodData != null) {
             _debugLog(
-                '⚠️  PIPELINE #$thisPipelineId → YIELD CacheStale (decode failed, has cache)');
+                '⚠️  PIPELINE #$pipelineId → YIELD CacheStale (decode failed, has cache)');
             final CacheStale<T> staleState = CacheStale<T>(
               cachedData: lastGoodData,
               refreshError: decodeError,
@@ -187,10 +207,10 @@ class FetchPipeline {
         }
 
         _debugLog(
-            '❌ PIPELINE #$thisPipelineId → YIELD CacheError (decode failed, no cache)');
+            '❌ PIPELINE #$pipelineId → YIELD CacheError (decode failed, no cache)');
         final CacheError<T> errorState = CacheError<T>(
           networkError: decodeError,
-          isOfflineFailure: false,
+          errorClassification: ErrorClassification.serverFailure,
           networkErrorStackTrace: decodeStack,
         );
         await _snapshotRegistry.saveLatestState(cacheKey, errorState);
@@ -198,19 +218,20 @@ class FetchPipeline {
         return;
       }
 
+      // Generation token check — skip write if newer pipeline already wrote
       final CacheEntry? currentEntry =
           await _cacheStore.readCacheEntry(cacheKey);
 
       final bool newerPipelineAlreadyWrote = currentEntry != null &&
-          currentEntry.entryMetadata.pipelineId > thisPipelineId;
+          currentEntry.entryMetadata.pipelineId > pipelineId;
 
       if (!newerPipelineAlreadyWrote) {
-        _debugLog('💾 PIPELINE #$thisPipelineId — writing to Hive');
+        _debugLog('💾 PIPELINE #$pipelineId — writing to Hive');
 
         final CacheMetadata freshEntryMetadata =
             CacheMetadata.fromNetworkResponse(
           ttl: ttl,
-          pipelineId: thisPipelineId,
+          pipelineId: pipelineId,
         );
 
         final CacheEntry freshCacheEntry = CacheEntry(
@@ -221,42 +242,55 @@ class FetchPipeline {
         await _cacheStore.writeCacheEntry(cacheKey, freshCacheEntry);
 
         _debugLog(
-            '✅ PIPELINE #$thisPipelineId → YIELD CacheSuccess(network)');
+            '✅ PIPELINE #$pipelineId → YIELD CacheSuccess(network)');
         final CacheSuccess<T> networkSuccessState = CacheSuccess<T>(
           cachedData: freshTypedData,
           dataSource: CacheSource.network,
           entryMetadata: freshEntryMetadata,
         );
-        await _snapshotRegistry.saveLatestState(cacheKey, networkSuccessState);
+        await _snapshotRegistry.saveLatestState(
+            cacheKey, networkSuccessState);
         yield networkSuccessState;
       } else {
         _debugLog(
-          '⏭️  PIPELINE #$thisPipelineId — skip write, newer pipeline '
+          '⏭️  PIPELINE #$pipelineId — skip write, newer pipeline '
           '${currentEntry.entryMetadata.pipelineId} already wrote\n'
-          '✅ PIPELINE #$thisPipelineId → YIELD CacheSuccess(network) anyway',
+          '✅ PIPELINE #$pipelineId → YIELD CacheSuccess(network) anyway',
         );
         final CacheSuccess<T> networkSuccessState = CacheSuccess<T>(
           cachedData: freshTypedData,
           dataSource: CacheSource.network,
           entryMetadata: currentEntry.entryMetadata,
         );
-        await _snapshotRegistry.saveLatestState(cacheKey, networkSuccessState);
+        await _snapshotRegistry.saveLatestState(
+            cacheKey, networkSuccessState);
         yield networkSuccessState;
       }
+    } on TimeoutException catch (timeoutError, stackTrace) {
+      // Bug 5 fix — TimeoutException caught separately from DioException
+      // Classified as timeoutFailure not offlineFailure
+      _debugLog(
+        '⏱️  PIPELINE #$pipelineId — TIMEOUT\n'
+        '   error: $timeoutError',
+      );
+       yield* _handleNetworkError<T>(
+        cacheKey: cacheKey,
+        networkError: timeoutError,
+        stackTrace: stackTrace,
+        pipelineId: pipelineId,
+        fromJsonConverter: fromJsonConverter,
+      );
     } catch (networkError, stackTrace) {
       _debugLog(
-        '❌ PIPELINE #$thisPipelineId — network FAILED\n'
+        '❌ PIPELINE #$pipelineId — network FAILED\n'
         '   error: $networkError',
       );
 
       final ErrorClassification errorClassification =
           ErrorClassifier.classifyNetworkError(networkError);
-      final bool isOffline =
-          errorClassification == ErrorClassification.offlineFailure;
 
       _debugLog(
-        '   classification: ${errorClassification.name}\n'
-        '   isOffline: $isOffline',
+        '   classification: ${errorClassification.name}',
       );
 
       final CacheEntry? currentEntryForError =
@@ -267,11 +301,15 @@ class FetchPipeline {
 
       if (currentEntryForError != null) {
         final T? staleTypedData = _decodeEntry(
-            currentEntryForError, fromJsonConverter, cacheKey, thisPipelineId);
+          currentEntryForError,
+          fromJsonConverter,
+          cacheKey,
+          pipelineId,
+        );
 
         if (staleTypedData != null) {
           _debugLog(
-              '⚠️  PIPELINE #$thisPipelineId → YIELD CacheStale (has cache)');
+              '⚠️  PIPELINE #$pipelineId → YIELD CacheStale (has cache)');
           final CacheStale<T> staleState = CacheStale<T>(
             cachedData: staleTypedData,
             refreshError: networkError,
@@ -284,17 +322,67 @@ class FetchPipeline {
       }
 
       _debugLog(
-          '❌ PIPELINE #$thisPipelineId → YIELD CacheError(isOffline: $isOffline)');
+          '❌ PIPELINE #$pipelineId → YIELD CacheError(${errorClassification.name})');
       final CacheError<T> errorState = CacheError<T>(
         networkError: networkError,
-        isOfflineFailure: isOffline,
+        errorClassification: errorClassification,
         networkErrorStackTrace: stackTrace,
       );
       await _snapshotRegistry.saveLatestState(cacheKey, errorState);
       yield errorState;
     }
 
-    _debugLog('🏁 PIPELINE #$thisPipelineId COMPLETED');
+    _debugLog('🏁 PIPELINE #$pipelineId COMPLETED');
+  }
+
+  /// Handles network errors by serving cached data as stale
+  /// or emitting CacheError if no cache exists.
+  /// Extracted to avoid code duplication between TimeoutException
+  /// and general catch blocks.
+  Stream<CacheState<T>> _handleNetworkError<T>({
+    required String cacheKey,
+    required Object networkError,
+    required StackTrace stackTrace,
+    required int pipelineId,
+    required T Function(dynamic json) fromJsonConverter,
+  }) async* {
+    final ErrorClassification errorClassification =
+        ErrorClassifier.classifyNetworkError(networkError);
+
+    final CacheEntry? currentEntryForError =
+        await _cacheStore.readCacheEntry(cacheKey);
+
+    if (currentEntryForError != null) {
+      final T? staleTypedData = _decodeEntry(
+        currentEntryForError,
+        fromJsonConverter,
+        cacheKey,
+        pipelineId,
+      );
+
+      if (staleTypedData != null) {
+        _debugLog(
+            '⚠️  PIPELINE #$pipelineId → YIELD CacheStale (has cache)');
+        final CacheStale<T> staleState = CacheStale<T>(
+          cachedData: staleTypedData,
+          refreshError: networkError,
+          refreshErrorStackTrace: stackTrace,
+        );
+        await _snapshotRegistry.saveLatestState(cacheKey, staleState);
+        yield staleState;
+        return;
+      }
+    }
+
+    _debugLog(
+        '❌ PIPELINE #$pipelineId → YIELD CacheError(${errorClassification.name})');
+    final CacheError<T> errorState = CacheError<T>(
+      networkError: networkError,
+      errorClassification: errorClassification,
+      networkErrorStackTrace: stackTrace,
+    );
+    await _snapshotRegistry.saveLatestState(cacheKey, errorState);
+    yield errorState;
   }
 
   T? _decodeEntry<T>(
@@ -317,7 +405,7 @@ class FetchPipeline {
 
   void _debugLog(String message) {
     if (_cacheConfig.enableDebugLogs && kDebugMode) {
-      log(message, name: 'FOC');
+      debugPrint('[FOC] $message');
     }
   }
 }

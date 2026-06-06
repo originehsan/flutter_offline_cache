@@ -9,7 +9,6 @@ final cacheCoordinatorProvider = Provider<CacheCoordinator>((ref) {
     cacheConfig: const CacheConfig(
       defaultTtl: Duration(seconds: 30),
       enableDebugLogs: true,
-      hiveBoxName: 'flutter_offline_cache_crypto', // new box name
     ),
   );
   ref.onDispose(coordinator.dispose);
@@ -22,13 +21,14 @@ final cryptoRepositoryProvider = Provider<CryptoRepository>((ref) {
   return CryptoRepository(coordinator: coordinator);
 });
 
-/// Counter to force hard reset.
+/// Counter to force hard reset — incremented by Hard Reset button.
 final cryptoResetCounterProvider = StateProvider<int>((ref) => 0);
 
-/// Stream provider for top coins.
-/// Automatically revalidates when TTL expires.
+/// Stream provider for top 10 coins.
+/// Automatically revalidates when TTL expires (every 30 seconds).
 /// Hard reset when counter changes.
-final topCoinsProvider = StreamProvider<CacheState<List<CryptoCoin>>>((ref) {
+final topCoinsProvider =
+    StreamProvider<CacheState<List<CryptoCoin>>>((ref) {
   ref.watch(cryptoResetCounterProvider);
   final repository = ref.watch(cryptoRepositoryProvider);
   return repository.watchTopCoins();

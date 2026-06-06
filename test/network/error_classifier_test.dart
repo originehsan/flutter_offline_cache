@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -57,6 +58,16 @@ void main() {
       expect(result, equals(ErrorClassification.serverFailure));
     });
 
+    test('TimeoutException classifies as timeoutFailure', () {
+      final TimeoutException error = TimeoutException(
+        'Request timed out',
+        const Duration(seconds: 30),
+      );
+      final ErrorClassification result =
+          ErrorClassifier.classifyNetworkError(error);
+      expect(result, equals(ErrorClassification.timeoutFailure));
+    });
+
     test('connectionTimeout with SocketException classifies as offlineFailure',
         () {
       final DioException error = DioException(
@@ -69,7 +80,8 @@ void main() {
       expect(result, equals(ErrorClassification.offlineFailure));
     });
 
-    test('connectionTimeout without SocketException classifies as serverFailure',
+    test(
+        'connectionTimeout without SocketException classifies as timeoutFailure',
         () {
       final DioException error = DioException(
         requestOptions: RequestOptions(path: '/test'),
@@ -77,7 +89,41 @@ void main() {
       );
       final ErrorClassification result =
           ErrorClassifier.classifyNetworkError(error);
-      expect(result, equals(ErrorClassification.serverFailure));
+      expect(result, equals(ErrorClassification.timeoutFailure));
+    });
+
+    test('receiveTimeout classifies as timeoutFailure', () {
+      final DioException error = DioException(
+        requestOptions: RequestOptions(path: '/test'),
+        type: DioExceptionType.receiveTimeout,
+      );
+      final ErrorClassification result =
+          ErrorClassifier.classifyNetworkError(error);
+      expect(result, equals(ErrorClassification.timeoutFailure));
+    });
+
+    test('sendTimeout classifies as timeoutFailure', () {
+      final DioException error = DioException(
+        requestOptions: RequestOptions(path: '/test'),
+        type: DioExceptionType.sendTimeout,
+      );
+      final ErrorClassification result =
+          ErrorClassifier.classifyNetworkError(error);
+      expect(result, equals(ErrorClassification.timeoutFailure));
+    });
+
+    test('HTTP 429 classifies as rateLimitFailure', () {
+      final DioException error = DioException(
+        requestOptions: RequestOptions(path: '/test'),
+        type: DioExceptionType.badResponse,
+        response: Response(
+          requestOptions: RequestOptions(path: '/test'),
+          statusCode: 429,
+        ),
+      );
+      final ErrorClassification result =
+          ErrorClassifier.classifyNetworkError(error);
+      expect(result, equals(ErrorClassification.rateLimitFailure));
     });
 
     test('unknown with SocketException classifies as offlineFailure', () {
@@ -89,6 +135,38 @@ void main() {
       final ErrorClassification result =
           ErrorClassifier.classifyNetworkError(error);
       expect(result, equals(ErrorClassification.offlineFailure));
+    });
+
+    test('shouldServeCachedData returns true for offlineFailure', () {
+      expect(
+        ErrorClassifier.shouldServeCachedData(
+            ErrorClassification.offlineFailure),
+        isTrue,
+      );
+    });
+
+    test('shouldServeCachedData returns true for timeoutFailure', () {
+      expect(
+        ErrorClassifier.shouldServeCachedData(
+            ErrorClassification.timeoutFailure),
+        isTrue,
+      );
+    });
+
+    test('shouldServeCachedData returns false for serverFailure', () {
+      expect(
+        ErrorClassifier.shouldServeCachedData(
+            ErrorClassification.serverFailure),
+        isFalse,
+      );
+    });
+
+    test('shouldServeCachedData returns false for rateLimitFailure', () {
+      expect(
+        ErrorClassifier.shouldServeCachedData(
+            ErrorClassification.rateLimitFailure),
+        isFalse,
+      );
     });
   });
 }
